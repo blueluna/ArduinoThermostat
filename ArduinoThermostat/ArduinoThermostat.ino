@@ -11,19 +11,20 @@
 #include <ErikLib.h>
 #include <PinChangeInt.h>
 #include <Wire.h>
-
-#define DISABLE_PCINT_MULTI_SERVICE
+#include <EEPROM.h>
 
 const uint8_t relay1Pin = 7;
 const uint8_t relay2Pin = 8;
-const uint8_t ledPin = 13;
 const uint8_t btnPin = A5;
 const uint8_t owPin = 5;
 const uint8_t rotA = 10;
 const uint8_t rotB = 9;
 const uint8_t rotRed = 11;
-const uint8_t rotGreen = 3;
+const uint8_t rotGreen = 13;
 const uint8_t rotBtn = 4;
+
+const uint8_t rotGreenLedBrightness = 32;
+const uint8_t rotRedLedBrightness = 16;
 
 const uint32_t relaySwitchDelay = 500; // milliseconds
 uint32_t relaySwitchTime = 0; // milliseconds
@@ -36,14 +37,18 @@ uint8_t *owAddressArray = 0; // array of 1-wire device addresses
 uint8_t owAddressArrayCount = 0; // number of devices in array of 1-wire device addresses
 
 uint8_t lastEncoded = 0;
-uint8_t encoderValue = 0;
-
+int16_t encoderValue = -10000;
+int16_t oldEncoderValue = -10000;
+uint32_t encoderUpdates = 0;
 
 enum {
   TM_NORMAL = 0,
   TM_LOW
 };
 uint8_t thermostatMode = TM_NORMAL;
+uint8_t oldThermostatMode = TM_NORMAL;
+int16_t thermostatThresholdNormal = 0;
+int16_t thermostatThresholdLow = 0;
 
 NMEASentence sentence(128);
 Button btnBoard(btnPin, 50);
@@ -54,6 +59,8 @@ enum {
   OW_CONFIGURED,
   OW_IDLE,
   OW_WAIT_FOR_CONVERSION,
+  OW_CONFIGURE_THRESHOLD,
+  OW_CHANGE_MODE,
   OW_READ_TEMPERATURE = 0x80
 };
 
@@ -72,9 +79,6 @@ void setup()
   relayActive = 2;
   relayToActivate = 2;
 
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH);
-
   pinMode(btnPin, INPUT_PULLUP);
 
   pinMode(owPin, OUTPUT); 
@@ -86,23 +90,18 @@ void setup()
   digitalWrite(rotB, HIGH);
   pinMode(rotBtn, INPUT); 
   digitalWrite(rotBtn, HIGH);
+
   pinMode(rotRed, OUTPUT); 
-  digitalWrite(rotRed, HIGH);
+  digitalWrite(rotRed, LOW);
   pinMode(rotGreen, OUTPUT); 
   digitalWrite(rotGreen, LOW);
-  delay(100);
-  digitalWrite(rotRed, LOW);
-  digitalWrite(rotGreen, HIGH);
-  delay(100);
-  digitalWrite(rotRed, HIGH);
-  digitalWrite(rotGreen, HIGH);
-  delay(100);
-  digitalWrite(rotRed, LOW);
-  digitalWrite(rotGreen, LOW);
 
-  Serial.begin(115200);
+  owLoadConfiguration();
 
   Wire.begin();
+  displayThreshold();
+
+  Serial.begin(115200);
 
   owState = OW_RESET;
   owHandler(t);
@@ -120,22 +119,8 @@ void loop()
   if (state == Button::Falling) {
     switchRelays(t);
   }
-  state = btnRot.Check(t);
-  if (state == Button::Falling) {
-    thermostatMode = (thermostatMode == TM_NORMAL) ? TM_LOW : TM_NORMAL;
-    if (thermostatMode == TM_NORMAL) {
-      digitalWrite(rotRed, HIGH);
-      digitalWrite(rotGreen, LOW);
-    }
-    else {
-      digitalWrite(rotGreen, HIGH);
-      digitalWrite(rotRed, LOW);
-    }
-  }
   handleRelays(t);
   owHandler(t);
-
-  analogWrite(ledPin, encoderValue);
 }
 
 void handleRelays(const uint32_t t)
@@ -150,6 +135,14 @@ void handleRelays(const uint32_t t)
       else if (relayToActivate == 2) {
         digitalWrite(relay2Pin, HIGH);
       }
+
+      sentence.clear();
+      sentence.print("RLY,"); 
+      sentence.print(relayActive);
+      sentence.comma();
+      sentence.print(relayToActivate);
+      Serial.print(sentence);
+
       relayActive = relayToActivate;
     }
   }
@@ -165,7 +158,23 @@ void switchRelays(const uint32_t t)
 
 void owHandler(const uint32_t t)
 {
-  uint8_t state = owState;
+  uint8_t state;
+  if (encoderValue != oldEncoderValue) {
+    if (oldEncoderValue > -10000) {
+      owStateTime = millis();
+      owState = OW_CONFIGURE_THRESHOLD;
+    }
+    encoderUpdates++;
+  }
+  else {
+    state = btnRot.Check(t);
+    if (state == Button::Falling) {
+      owStateTime = millis();
+      thermostatMode = (thermostatMode == TM_NORMAL) ? TM_LOW : TM_NORMAL;
+      owState = OW_CHANGE_MODE;
+    }
+  }
+  state = owState;
   if ((state & OW_READ_TEMPERATURE) == OW_READ_TEMPERATURE) {
     state = OW_READ_TEMPERATURE;
   }
@@ -184,6 +193,20 @@ void owHandler(const uint32_t t)
         owStateTime = millis();
       }
       break;
+    case OW_CONFIGURE_THRESHOLD:
+      owConfigureThreshold();
+      if (t > (owStateTime + 10000)) {
+        owStoreConfiguration();
+        owState = OW_IDLE;
+      }
+      break;
+    case OW_CHANGE_MODE:
+      owChangeMode();
+      if (t > (owStateTime + 10000)) {
+        owStoreConfiguration();
+        owState = OW_IDLE;
+      }
+      break;
     case OW_WAIT_FOR_CONVERSION:
       if (t < (owStateTime + 1000)) {
         break;
@@ -194,6 +217,10 @@ void owHandler(const uint32_t t)
       owReadTemperature();
       owStateTime = t;
       break;
+  }
+
+  if (encoderValue != oldEncoderValue) {
+    oldEncoderValue = encoderValue;
   }
 }
 
@@ -283,12 +310,12 @@ void owReadTemperature()
     for (int i = 0; i < 8; i++) {
       ErikLib::HexPrint(sentence, *(address + i));
     }
-    sentence.print(",");
+    sentence.comma();
     int16_t temp_16 = (int16_t)(data[1]) << 8 | data[0];
     float temp = temp_16 / 16.0f;
     sentence.print(temp, 4);
     Serial.print(sentence);
-    setDisplay(temp);
+    displayTemperature(temp, 32);
   }
   else {
     Serial.println();
@@ -302,21 +329,123 @@ void owReadTemperature()
   }
 }
 
+void owConfigureThreshold()
+{
+  if (encoderValue != oldEncoderValue) {
+    if (thermostatMode == TM_LOW) {
+      thermostatThresholdLow = encoderValue;
+    }
+    else {
+      thermostatThresholdNormal = encoderValue;
+    }
+    displayThreshold();
+  }
+}
+
+void owChangeMode()
+{
+  if (oldThermostatMode != thermostatMode) {
+    displayThreshold();
+  }
+  oldThermostatMode = thermostatMode;
+}
+
+void owLoadConfiguration()
+{
+  uint8_t dat8_1, dat8_2;
+  thermostatMode = EEPROM.read(0x10);
+  oldThermostatMode = thermostatMode;
+  dat8_1 = EEPROM.read(0x11);
+  dat8_2 = EEPROM.read(0x12);
+  thermostatThresholdNormal = (int16_t)(dat8_1) << 8 | dat8_2;
+  dat8_1 = EEPROM.read(0x13);
+  dat8_2 = EEPROM.read(0x14);
+  thermostatThresholdLow = (int16_t)(dat8_1) << 8 | dat8_2;
+
+  if (thermostatMode == TM_LOW) {
+    encoderValue = thermostatThresholdLow;
+  }
+  else {
+    encoderValue = thermostatThresholdNormal;
+  }
+}
+
+void owStoreConfiguration()
+{
+  uint8_t dat8_1, dat8_2;
+  int16_t dat16;
+  uint8_t changes = 0;
+  dat8_1 = EEPROM.read(0x10);
+  if (thermostatMode != dat8_1) {
+    EEPROM.write(0x10, thermostatMode);
+    changes++;
+  }
+  dat8_1 = EEPROM.read(0x11);
+  dat8_2 = EEPROM.read(0x12);
+  dat16 = (int16_t)(dat8_1) << 8 | dat8_2;
+  if (thermostatThresholdNormal != dat16) {
+    EEPROM.write(0x11, (uint8_t)(thermostatThresholdNormal >> 8));
+    EEPROM.write(0x12, (uint8_t)(thermostatThresholdNormal));
+    changes++;
+  }
+  dat8_1 = EEPROM.read(0x13);
+  dat8_2 = EEPROM.read(0x14);
+  dat16 = (int16_t)(dat8_1) << 8 | dat8_2;
+  if (thermostatThresholdLow != dat16) {
+    EEPROM.write(0x13, (uint8_t)(thermostatThresholdLow >> 8));
+    EEPROM.write(0x14, (uint8_t)(thermostatThresholdLow));
+    changes++;
+  }
+  displayClear();
+
+  if (changes > 0) {
+    sentence.clear();
+    sentence.print("CFG,"); 
+    sentence.print(thermostatMode);
+    sentence.comma();
+    sentence.print(thermostatThresholdNormal);
+    sentence.comma();
+    sentence.print(thermostatThresholdLow);
+    Serial.print(sentence);
+  }
+}
+
 void updateEncoder()
 {
-  uint8_t MSB = digitalRead(rotA); //MSB = most significant bit
-  uint8_t LSB = digitalRead(rotB); //LSB = least significant bit
+  uint8_t MSB = digitalRead(rotA); // MSB = most significant bit
+  uint8_t LSB = digitalRead(rotB); // LSB = least significant bit
 
-  uint8_t encoded = (MSB << 1) | LSB; //converting the 2 pin value to single number
-  uint8_t sum  = (lastEncoded << 2) | encoded; //adding it to the previous encoded value
+  uint8_t encoded = (MSB << 1) | LSB; // converting the 2 pin value to single number
+  uint8_t sum  = (lastEncoded << 2) | encoded; // adding it to the previous encoded value
+
+  if (thermostatMode == TM_LOW) {
+    encoderValue = thermostatThresholdLow;
+  }
+  else {
+    encoderValue = thermostatThresholdNormal;
+  }
 
   if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) encoderValue ++;
   if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) encoderValue --;
 
-  lastEncoded = encoded; //store this value for next time
+  if (encoderValue > 999) {
+    encoderValue = 999;
+  }
+  else if (encoderValue < -999) {
+    encoderValue = -999;
+  }
+
+  lastEncoded = encoded; // store this value for next time
 }
 
-void setDisplay(const float value)
+void displayTemperature(const float value, const uint8_t brightness)
+{
+  displayFloat(value, brightness);
+  digitalWrite(rotRed, LOW);
+  digitalWrite(rotGreen, LOW);
+}
+
+void displayFloat(const float value, const uint8_t brightness)
 {
   if (value > 99.9f || value < -99.9f) {
     return;
@@ -325,15 +454,22 @@ void setDisplay(const float value)
   uint8_t digit;
   uint8_t chars[4] = {0};
   // negative ?
-  if (value < 0) {
+  if (v < 0) {
     chars[0] = 0x2D;
+    v = -v;
   }
   else {
     chars[0] = 0x10;
   }
 
   digit = (uint8_t)(v / 10.0f);
-  chars[1] = digit;
+  if (digit == 0) {
+    chars[1] = chars[0];
+    chars[0] = 0x10;
+  }
+  else {
+    chars[1] = digit;
+  }
   v = v - (digit * 10);
   digit = (uint8_t)(v);
   chars[2] = digit;
@@ -343,6 +479,8 @@ void setDisplay(const float value)
 
   Wire.beginTransmission(0x71);
   Wire.write(0x76); // clear
+  Wire.write(0x7A);  // brightness
+  Wire.write(brightness);
   digit = thermostatMode == TM_LOW ? 0x24 : 0x04;
   Wire.write(0x77); // set dot
   Wire.write(digit); // set dot
@@ -350,4 +488,31 @@ void setDisplay(const float value)
     Wire.write(chars[n]);
   }
   Wire.endTransmission();
+}
+
+void displayThreshold()
+{
+  int16_t threshold = 0;
+  float temp = 0.0f;
+  if (thermostatMode == TM_LOW) {
+    threshold = thermostatThresholdLow;
+    analogWrite(rotGreen, rotGreenLedBrightness);
+    digitalWrite(rotRed, LOW);
+  }
+  else {
+    threshold = thermostatThresholdNormal;
+    analogWrite(rotRed, rotRedLedBrightness);
+    digitalWrite(rotGreen, LOW);
+  }
+  temp = threshold / 10.0f;
+  displayFloat(temp, 192);
+}
+
+void displayClear()
+{
+  Wire.beginTransmission(0x71);
+  Wire.write(0x76); // clear
+  Wire.endTransmission();
+  digitalWrite(rotRed, LOW);
+  digitalWrite(rotGreen, LOW);
 }
