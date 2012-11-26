@@ -51,6 +51,7 @@ int16_t thermostatThresholdNormal = 0;
 int16_t thermostatThresholdLow = 0;
 
 NMEASentence sentence(128);
+NMEAParser parser(128);
 Button btnBoard(btnPin, 50);
 Button btnRot(rotBtn, 50);
 
@@ -121,6 +122,18 @@ void loop()
   }
   handleRelays(t);
   owHandler(t);
+  if (Serial.available()) {
+    int16_t result = parser.Parse(Serial);
+    if (result == E_SUCCESS) {
+      handleSentence();
+    }
+    else {
+      sentence.clear();
+      sentence.print("$ERR,");
+      sentence.print(result);
+      Serial.print(sentence);
+    }
+  }
 }
 
 void handleRelays(const uint32_t t)
@@ -137,7 +150,7 @@ void handleRelays(const uint32_t t)
       }
 
       sentence.clear();
-      sentence.print("RLY,"); 
+      sentence.print("RLY,");
       sentence.print(relayActive);
       sentence.comma();
       sentence.print(relayToActivate);
@@ -399,14 +412,7 @@ void owStoreConfiguration()
   displayClear();
 
   if (changes > 0) {
-    sentence.clear();
-    sentence.print("CFG,"); 
-    sentence.print(thermostatMode);
-    sentence.comma();
-    sentence.print(thermostatThresholdNormal);
-    sentence.comma();
-    sentence.print(thermostatThresholdLow);
-    Serial.print(sentence);
+    sendCFGSentence();
   }
 }
 
@@ -515,4 +521,69 @@ void displayClear()
   Wire.endTransmission();
   digitalWrite(rotRed, LOW);
   digitalWrite(rotGreen, LOW);
+}
+
+void handleSentence()
+{
+  uint8_t tokens = parser.Tokens();
+  uint8_t n = 0;
+  int16_t len = 0;
+  if (tokens == 0) {
+    return;
+  }
+  const char* token = reinterpret_cast<const char*>(parser.Token(n, len));
+  if (len != 3) {
+    return;
+  }
+  if (strncmp(token, "CFG", 3) == 0 && tokens == 4) {
+    if (tokens == 4) {
+      handleCFGSentence(n+1);
+    }
+    else {
+      sendCFGSentence();
+    }
+  }
+  /*
+  for (uint8_t n = 0; n < parser.Tokens(); n++) {
+    int16_t len = 0;
+    const uint8_t* token = parser.Token(n, len);
+  }
+  sentence.clear();
+  sentence.write(parser.GetSentence().Peek(), parser.GetSentence().Used());
+  Serial.print(sentence);
+  */
+}
+
+void handleCFGSentence(const uint8_t n)
+{
+  int16_t len = 0;
+  int16_t mode, normalThreshold, lowThreshold;
+  const char* token;
+  token = reinterpret_cast<const char*>(parser.Token(n, len));
+  mode = strtoul(token, 0, 10);
+  token = reinterpret_cast<const char*>(parser.Token(n+1, len));
+  normalThreshold = strtol(token, 0, 10);
+  token = reinterpret_cast<const char*>(parser.Token(n+2, len));
+  lowThreshold = strtol(token, 0, 10);
+
+  sentence.clear();
+  sentence.print("CFG,");
+  sentence.print(mode);
+  sentence.print(',');
+  sentence.print(normalThreshold);
+  sentence.print(',');
+  sentence.print(lowThreshold);
+  Serial.print(sentence);
+}
+
+void sendCFGSentence()
+{
+  sentence.clear();
+  sentence.print("CFG,"); 
+  sentence.print(thermostatMode);
+  sentence.comma();
+  sentence.print(thermostatThresholdNormal);
+  sentence.comma();
+  sentence.print(thermostatThresholdLow);
+  Serial.print(sentence);
 }
