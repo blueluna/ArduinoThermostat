@@ -43,7 +43,8 @@ uint32_t encoderUpdates = 0;
 
 enum {
   TM_NORMAL = 0,
-  TM_LOW
+  TM_LOW,
+  TM_END
 };
 uint8_t thermostatMode = TM_NORMAL;
 uint8_t oldThermostatMode = TM_NORMAL;
@@ -55,18 +56,28 @@ NMEAParser parser(128);
 Button btnBoard(btnPin, 50);
 Button btnRot(rotBtn, 50);
 
+float temperature = -100.0;
+float temperatureOld = -100.0;
+
 enum {
   OW_RESET = 0,
   OW_CONFIGURED,
   OW_IDLE,
   OW_WAIT_FOR_CONVERSION,
-  OW_CONFIGURE_THRESHOLD,
-  OW_CHANGE_MODE,
   OW_READ_TEMPERATURE = 0x80
 };
 
 uint8_t owState = OW_RESET; // current state of the 1-wire state machine
 uint32_t owStateTime = 0; // time for the last state change
+
+enum {
+  DS_IDLE = 0,
+  DS_CONFIGURE_THRESHOLD,
+  DS_CHANGE_MODE
+};
+
+uint8_t dsState = OW_RESET; // current state of the 1-wire state machine
+uint32_t dsStateTime = 0; // time for the last state change
 
 void setup()
 {
@@ -97,7 +108,7 @@ void setup()
   pinMode(rotGreen, OUTPUT); 
   digitalWrite(rotGreen, LOW);
 
-  owLoadConfiguration();
+  loadConfiguration();
 
   Wire.begin();
   displayThreshold();
@@ -105,7 +116,11 @@ void setup()
   Serial.begin(115200);
 
   owState = OW_RESET;
+  owStateTime = t;
+  dsState = DS_CONFIGURE_THRESHOLD;
+  dsStateTime = t;
   owHandler(t);
+  dsHandler(t);
 
   PCintPort::attachInterrupt(rotA, &updateEncoder, CHANGE);
   PCintPort::attachInterrupt(rotB, &updateEncoder, CHANGE);
@@ -122,6 +137,7 @@ void loop()
   }
   handleRelays(t);
   owHandler(t);
+  dsHandler(t);
   if (Serial.available()) {
     int16_t result = parser.Parse(Serial);
     if (result == E_SUCCESS) {
@@ -150,7 +166,7 @@ void handleRelays(const uint32_t t)
       }
 
       sentence.clear();
-      sentence.print("RLY,");
+      sentence.print("CTL,");
       sentence.print(relayActive);
       sentence.comma();
       sentence.print(relayToActivate);
@@ -171,23 +187,7 @@ void switchRelays(const uint32_t t)
 
 void owHandler(const uint32_t t)
 {
-  uint8_t state;
-  if (encoderValue != oldEncoderValue) {
-    if (oldEncoderValue > -10000) {
-      owStateTime = millis();
-      owState = OW_CONFIGURE_THRESHOLD;
-    }
-    encoderUpdates++;
-  }
-  else {
-    state = btnRot.Check(t);
-    if (state == Button::Falling) {
-      owStateTime = millis();
-      thermostatMode = (thermostatMode == TM_NORMAL) ? TM_LOW : TM_NORMAL;
-      owState = OW_CHANGE_MODE;
-    }
-  }
-  state = owState;
+  uint8_t state = owState;
   if ((state & OW_READ_TEMPERATURE) == OW_READ_TEMPERATURE) {
     state = OW_READ_TEMPERATURE;
   }
@@ -203,21 +203,7 @@ void owHandler(const uint32_t t)
     case OW_IDLE:
       if (t > (owStateTime + 5000)) {
         owStartConversion();
-        owStateTime = millis();
-      }
-      break;
-    case OW_CONFIGURE_THRESHOLD:
-      owConfigureThreshold();
-      if (t > (owStateTime + 10000)) {
-        owStoreConfiguration();
-        owState = OW_IDLE;
-      }
-      break;
-    case OW_CHANGE_MODE:
-      owChangeMode();
-      if (t > (owStateTime + 10000)) {
-        owStoreConfiguration();
-        owState = OW_IDLE;
+        owStateTime = t;
       }
       break;
     case OW_WAIT_FOR_CONVERSION:
@@ -230,10 +216,6 @@ void owHandler(const uint32_t t)
       owReadTemperature();
       owStateTime = t;
       break;
-  }
-
-  if (encoderValue != oldEncoderValue) {
-    oldEncoderValue = encoderValue;
   }
 }
 
@@ -318,20 +300,10 @@ void owReadTemperature()
   crcOk = data[8] == OneWire::crc8(data, 8);
 
   if (crcOk && address[0] == 0x28) {
-    sentence.clear();
-    sentence.print("TMP,"); 
-    for (int i = 0; i < 8; i++) {
-      ErikLib::HexPrint(sentence, *(address + i));
-    }
-    sentence.comma();
     int16_t temp_16 = (int16_t)(data[1]) << 8 | data[0];
     float temp = temp_16 / 16.0f;
-    sentence.print(temp, 4);
-    Serial.print(sentence);
-    displayTemperature(temp, 32);
-  }
-  else {
-    Serial.println();
+    temperature = temp;
+    sendTMPSentence(address, temp);
   }
   index++;
   if (index < owAddressArrayCount && index < 0x7f) {
@@ -342,7 +314,54 @@ void owReadTemperature()
   }
 }
 
-void owConfigureThreshold()
+void dsHandler(const uint32_t t)
+{
+  uint8_t state;
+  if (encoderValue != oldEncoderValue) {
+    if (oldEncoderValue > -10000) {
+      dsStateTime = t;
+      dsState = DS_CONFIGURE_THRESHOLD;
+    }
+    encoderUpdates++;
+  }
+  else {
+    state = btnRot.Check(t);
+    if (state == Button::Falling) {
+      dsStateTime = t;
+      thermostatMode = (thermostatMode == TM_NORMAL) ? TM_LOW : TM_NORMAL;
+      dsState = DS_CHANGE_MODE;
+    }
+  }
+
+  switch (dsState) {
+    case DS_IDLE:
+      if (temperatureOld != temperature) {
+        displayTemperature(temperature, 32);
+      }
+      temperatureOld = temperature;
+      break;
+    case DS_CONFIGURE_THRESHOLD:
+      configureThreshold();
+      if (t > (dsStateTime + 10000)) {
+        storeConfiguration();
+        dsState = DS_IDLE;
+      }
+      break;
+    case DS_CHANGE_MODE:
+      changeMode();
+      if (t > (dsStateTime + 10000)) {
+        storeConfiguration();
+        dsState = DS_IDLE;
+      }
+      break;
+  }
+
+  if (encoderValue != oldEncoderValue) {
+    oldEncoderValue = encoderValue;
+  }
+}
+
+void configureThreshold()
 {
   if (encoderValue != oldEncoderValue) {
     if (thermostatMode == TM_LOW) {
@@ -355,7 +374,7 @@ void owConfigureThreshold()
   }
 }
 
-void owChangeMode()
+void changeMode()
 {
   if (oldThermostatMode != thermostatMode) {
     displayThreshold();
@@ -363,7 +382,7 @@ void owChangeMode()
   oldThermostatMode = thermostatMode;
 }
 
-void owLoadConfiguration()
+void loadConfiguration()
 {
   uint8_t dat8_1, dat8_2;
   thermostatMode = EEPROM.read(0x10);
@@ -383,7 +402,7 @@ void owLoadConfiguration()
   }
 }
 
-void owStoreConfiguration()
+void storeConfiguration()
 {
   uint8_t dat8_1, dat8_2;
   int16_t dat16;
@@ -409,8 +428,6 @@ void owStoreConfiguration()
     EEPROM.write(0x14, (uint8_t)(thermostatThresholdLow));
     changes++;
   }
-  displayClear();
-
   if (changes > 0) {
     sendCFGSentence();
   }
@@ -535,23 +552,18 @@ void handleSentence()
   if (len != 3) {
     return;
   }
-  if (strncmp(token, "CFG", 3) == 0 && tokens == 4) {
+  n++;
+  if (strncmp(token, "CFG", 3) == 0) {
     if (tokens == 4) {
-      handleCFGSentence(n+1);
+      handleCFGSentence(n);
     }
     else {
       sendCFGSentence();
     }
   }
-  /*
-  for (uint8_t n = 0; n < parser.Tokens(); n++) {
-    int16_t len = 0;
-    const uint8_t* token = parser.Token(n, len);
+  else if (strncmp(token, "STO", 3) == 0) {
+    storeConfiguration();
   }
-  sentence.clear();
-  sentence.write(parser.GetSentence().Peek(), parser.GetSentence().Used());
-  Serial.print(sentence);
-  */
 }
 
 void handleCFGSentence(const uint8_t n)
@@ -566,14 +578,17 @@ void handleCFGSentence(const uint8_t n)
   token = reinterpret_cast<const char*>(parser.Token(n+2, len));
   lowThreshold = strtol(token, 0, 10);
 
-  sentence.clear();
-  sentence.print("CFG,");
-  sentence.print(mode);
-  sentence.print(',');
-  sentence.print(normalThreshold);
-  sentence.print(',');
-  sentence.print(lowThreshold);
-  Serial.print(sentence);
+  uint8_t cfgOk = 0;
+  if (mode >= 0 && mode < TM_END) { cfgOk++; }
+  if (normalThreshold >= -999 && normalThreshold <= 999) { cfgOk++; }
+  if (lowThreshold >= -999 && lowThreshold <= 999) { cfgOk++; }
+
+  if (cfgOk == 3) {
+    thermostatMode = mode;
+    thermostatThresholdNormal = normalThreshold;
+    thermostatThresholdLow = lowThreshold;
+  }
+  sendCFGSentence();
 }
 
 void sendCFGSentence()
@@ -587,3 +602,16 @@ void sendCFGSentence()
   sentence.print(thermostatThresholdLow);
   Serial.print(sentence);
 }
+
+void sendTMPSentence(const uint8_t address[8], const float temp)
+{
+  sentence.clear();
+  sentence.print("TMP,"); 
+  for (int i = 0; i < 8; i++) {
+    ErikLib::HexPrint(sentence, *(address + i));
+  }
+  sentence.comma();
+  sentence.print(temp, 4);
+  Serial.print(sentence);
+}
+
