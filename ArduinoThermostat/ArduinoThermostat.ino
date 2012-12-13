@@ -26,10 +26,12 @@ const uint8_t rotBtn = 4;
 const uint8_t rotGreenLedBrightness = 32;
 const uint8_t rotRedLedBrightness = 16;
 
-const uint32_t relaySwitchDelay = 500; // milliseconds
+const uint32_t relaySwitchDelay = 900000; // 15 minutes in milliseconds
 uint32_t relaySwitchTime = 0; // milliseconds
-uint8_t relayActive = 0; // the active relay (1 or 2)
-uint8_t relayToActivate = 0; // the relay to activate (1 or 2)
+uint8_t relayState = 0; // the relay state
+int16_t temperatureAccumulator = 0;
+uint8_t readoutCount = 0;
+int16_t temperatureAverage = 0;
 
 OneWire ow(owPin); // The 1-wire bus
 uint8_t owAddressArrayCapacity = 0; // capacity for array of 1-wire device addresses
@@ -50,6 +52,10 @@ uint8_t thermostatMode = TM_NORMAL;
 uint8_t oldThermostatMode = TM_NORMAL;
 int16_t thermostatThresholdNormal = 0;
 int16_t thermostatThresholdLow = 0;
+int8_t hysteresisUpper = 5;
+int8_t hysteresisLower = -5;
+uint8_t masterSensor[8] = {0};
+int8_t masterFound = 0;
 
 NMEASentence sentence(128);
 NMEAParser parser(128);
@@ -86,10 +92,9 @@ void setup()
   pinMode(relay1Pin, OUTPUT); 
   digitalWrite(relay1Pin, LOW);
   pinMode(relay2Pin, OUTPUT); 
-  digitalWrite(relay2Pin, HIGH);
+  digitalWrite(relay2Pin, LOW);
   relaySwitchTime = t;
-  relayActive = 2;
-  relayToActivate = 2;
+  relayState = 0;
 
   pinMode(btnPin, INPUT_PULLUP);
 
@@ -113,7 +118,9 @@ void setup()
   Wire.begin();
   displayThreshold();
 
-  Serial.begin(115200);
+  Serial1.begin(115200);
+
+  sendCFGSentence();
 
   owState = OW_RESET;
   owStateTime = t;
@@ -130,59 +137,47 @@ void loop()
 {
   uint8_t state;
   uint32_t t = millis();
-  // Use the button to control the relay
-  state = btnBoard.Check(t);
-  if (state == Button::Falling) {
-    switchRelays(t);
-  }
   handleRelays(t);
   owHandler(t);
   dsHandler(t);
-  if (Serial.available()) {
-    int16_t result = parser.Parse(Serial);
+  if (Serial1.available()) {
+    int16_t result = parser.Parse(Serial1);
     if (result == E_SUCCESS) {
       handleSentence();
     }
     else {
-      sentence.clear();
-      sentence.print("$ERR,");
-      sentence.print(result);
-      Serial.print(sentence);
+      sendERRSentence(result);
     }
   }
 }
 
 void handleRelays(const uint32_t t)
 {
-  if (relayActive != relayToActivate) {
-    if (t >= (relaySwitchTime + relaySwitchDelay)) {
-      digitalWrite(relay1Pin, LOW);
-      digitalWrite(relay2Pin, LOW);
-      if (relayToActivate == 1) {
+  if (t >= (relaySwitchTime + relaySwitchDelay)) {
+    relaySwitchTime = t;
+    int16_t threshold;
+    switch (thermostatMode) {
+      case TM_LOW:
+        threshold = thermostatThresholdLow;
+        break;
+      default:
+        threshold = thermostatThresholdNormal;
+        break;
+    }
+    if (relayState == 1) {
+      if (temperatureAverage > (threshold + hysteresisUpper)) {
+        relayState = 0;
+        digitalWrite(relay1Pin, LOW);
+      }
+    }
+    else {
+      if (temperatureAverage < (threshold + hysteresisLower)) {
+        relayState = 1;
         digitalWrite(relay1Pin, HIGH);
       }
-      else if (relayToActivate == 2) {
-        digitalWrite(relay2Pin, HIGH);
-      }
-
-      sentence.clear();
-      sentence.print("CTL,");
-      sentence.print(relayActive);
-      sentence.comma();
-      sentence.print(relayToActivate);
-      Serial.print(sentence);
-
-      relayActive = relayToActivate;
     }
+    sendCTLSentence();
   }
-}
-
-void switchRelays(const uint32_t t)
-{
-  digitalWrite(relay1Pin, LOW);
-  digitalWrite(relay2Pin, LOW);
-  relayToActivate = relayActive == 2 ? 1 : 2;
-  relaySwitchTime = t;
 }
 
 void owHandler(const uint32_t t)
@@ -245,16 +240,14 @@ void owScanBus()
       owAddressArray = reinterpret_cast<uint8_t*>(malloc(count * 8));
       owAddressArrayCapacity = count;
     }
-
+    masterFound = 0;
     uint8_t *ptr = owAddressArray;
     more = ow.search(ptr);
     for (uint8_t n = 0; n < count && more == 1; n++) {
-      sentence.clear();
-      sentence.print("SCN,");
-      for (int i = 0; i < 8; i++) {
-        ErikLib::HexPrint(sentence, *(ptr + i));
+      if (memcmp(ptr, masterSensor, 8) == 0) {
+        masterFound = 1;
       }
-      Serial.print(sentence);
+      sendSCNSentence(ptr);
       ptr += 8;
       owAddressArrayCount++;
       more = ow.search(ptr);
@@ -275,6 +268,18 @@ void owStartConversion()
   ow.skip(); // Address all devices
   ow.write(0x44, 1); // Start conversion
   owState = OW_WAIT_FOR_CONVERSION;
+}
+
+void calulateAverage(int16_t temp)
+{
+  temperatureAccumulator += (int16_t)(temp / 1.6f);
+  readoutCount++;
+  if (readoutCount == 32) {
+    temperatureAverage = (temperatureAccumulator / 32);
+    temperatureAccumulator = 0;
+    readoutCount = 0;
+    sendAVGSentence();
+  }
 }
 
 void owReadTemperature()
@@ -302,8 +307,19 @@ void owReadTemperature()
   if (crcOk && address[0] == 0x28) {
     int16_t temp_16 = (int16_t)(data[1]) << 8 | data[0];
     float temp = temp_16 / 16.0f;
-    temperature = temp;
     sendTMPSentence(address, temp);
+    if (masterFound == 1) {
+      if (memcmp(address, masterSensor, 8) == 0) {
+        calulateAverage(temp_16);
+        temperature = temp;
+      }
+    }
+    else {
+      if (index == 0) {
+        calulateAverage(temp_16);
+        temperature = temp;
+      }
+    }
   }
   index++;
   if (index < owAddressArrayCount && index < 0x7f) {
@@ -387,24 +403,36 @@ void loadConfiguration()
   uint8_t dat8_1, dat8_2;
   thermostatMode = EEPROM.read(0x10);
   oldThermostatMode = thermostatMode;
-  dat8_1 = EEPROM.read(0x11);
-  dat8_2 = EEPROM.read(0x12);
-  thermostatThresholdNormal = (int16_t)(dat8_1) << 8 | dat8_2;
-  dat8_1 = EEPROM.read(0x13);
-  dat8_2 = EEPROM.read(0x14);
-  thermostatThresholdLow = (int16_t)(dat8_1) << 8 | dat8_2;
-
   if (thermostatMode == TM_LOW) {
     encoderValue = thermostatThresholdLow;
   }
   else {
     encoderValue = thermostatThresholdNormal;
   }
+  dat8_1 = EEPROM.read(0x11);
+  dat8_2 = EEPROM.read(0x12);
+  thermostatThresholdNormal = (int16_t)(dat8_1) << 8 | dat8_2;
+  dat8_1 = EEPROM.read(0x13);
+  dat8_2 = EEPROM.read(0x14);
+  thermostatThresholdLow = (int16_t)(dat8_1) << 8 | dat8_2;
+  dat8_1 = EEPROM.read(0x15);
+  hysteresisUpper = (int8_t)dat8_1;
+  dat8_1 = EEPROM.read(0x16);
+  hysteresisLower = (int8_t)dat8_1;
+  masterSensor[0] = EEPROM.read(0x18);
+  masterSensor[1] = EEPROM.read(0x19);
+  masterSensor[2] = EEPROM.read(0x1a);
+  masterSensor[3] = EEPROM.read(0x1b);
+  masterSensor[4] = EEPROM.read(0x1c);
+  masterSensor[5] = EEPROM.read(0x1d);
+  masterSensor[6] = EEPROM.read(0x1e);
+  masterSensor[7] = EEPROM.read(0x1f);
 }
 
 void storeConfiguration()
 {
   uint8_t dat8_1, dat8_2;
+  int8_t di8;
   int16_t dat16;
   uint8_t changes = 0;
   dat8_1 = EEPROM.read(0x10);
@@ -427,6 +455,20 @@ void storeConfiguration()
     EEPROM.write(0x13, (uint8_t)(thermostatThresholdLow >> 8));
     EEPROM.write(0x14, (uint8_t)(thermostatThresholdLow));
     changes++;
+  }
+  di8 = (int8_t)(EEPROM.read(0x15));
+  if (di8 != hysteresisUpper) {
+    EEPROM.write(0x15, (uint8_t)(hysteresisUpper));
+  }
+  di8 = (int8_t)(EEPROM.read(0x16));
+  if (di8 != hysteresisLower) {
+    EEPROM.write(0x16, (uint8_t)(hysteresisLower));
+  }
+  for (int8_t n = 0; n < 8; n++) {
+    dat8_1 = EEPROM.read(0x18 + n);
+    if (masterSensor[n] != dat8_1) {
+      EEPROM.write(0x18 + n, masterSensor[n]);
+    }
   }
   if (changes > 0) {
     sendCFGSentence();
@@ -561,8 +603,11 @@ void handleSentence()
       sendCFGSentence();
     }
   }
-  else if (strncmp(token, "STO", 3) == 0) {
-    storeConfiguration();
+  else if (strncmp(token, "SCN", 3) == 0) {
+    owScanBus();
+  }
+  else if (strncmp(token, "CTL", 3) == 0) {
+    sendCTLSentence();
   }
 }
 
@@ -570,6 +615,8 @@ void handleCFGSentence(const uint8_t n)
 {
   int16_t len = 0;
   int16_t mode, normalThreshold, lowThreshold;
+  int8_t hystUpper, hystLower;
+  uint8_t address[8] = {0};
   const char* token;
   token = reinterpret_cast<const char*>(parser.Token(n, len));
   mode = strtoul(token, 0, 10);
@@ -577,16 +624,34 @@ void handleCFGSentence(const uint8_t n)
   normalThreshold = strtol(token, 0, 10);
   token = reinterpret_cast<const char*>(parser.Token(n+2, len));
   lowThreshold = strtol(token, 0, 10);
+  token = reinterpret_cast<const char*>(parser.Token(n+3, len));
+  hystUpper = strtol(token, 0, 10);
+  token = reinterpret_cast<const char*>(parser.Token(n+4, len));
+  hystLower = strtol(token, 0, 10);
+  token = reinterpret_cast<const char*>(parser.Token(n+4, len));
+  for (uint8_t n = 0; n < 8; n++) {
+    address[n] = strtoul(token, 0, 16) & 0xff;
+    token += 2; 
+  }
 
   uint8_t cfgOk = 0;
   if (mode >= 0 && mode < TM_END) { cfgOk++; }
   if (normalThreshold >= -999 && normalThreshold <= 999) { cfgOk++; }
   if (lowThreshold >= -999 && lowThreshold <= 999) { cfgOk++; }
+  if (hystUpper >= -125 && hystUpper <= 125) { cfgOk++; }
+  if (hystLower >= -125 && hystLower <= 125) { cfgOk++; }
+  if (address[0] == 0x28) { cfgOk++; }
 
-  if (cfgOk == 3) {
+  if (cfgOk == 6) {
     thermostatMode = mode;
     thermostatThresholdNormal = normalThreshold;
     thermostatThresholdLow = lowThreshold;
+    hysteresisUpper = hystUpper;
+    hysteresisLower = hystLower;
+    memcpy(masterSensor, address, 8);
+    masterFound = 0;
+    storeConfiguration();
+    owScanBus();
   }
   sendCFGSentence();
 }
@@ -600,18 +665,60 @@ void sendCFGSentence()
   sentence.print(thermostatThresholdNormal);
   sentence.comma();
   sentence.print(thermostatThresholdLow);
-  Serial.print(sentence);
+  sentence.comma();
+  sentence.print(hysteresisUpper);
+  sentence.comma();
+  sentence.print(hysteresisLower);
+  sentence.comma();
+  printAddress(sentence, masterSensor);
+  Serial1.print(sentence);
+}
+
+void sendSCNSentence(const uint8_t address[8])
+{
+  sentence.clear();
+  sentence.print("SCN,");
+  printAddress(sentence, address);
+  Serial1.print(sentence);
 }
 
 void sendTMPSentence(const uint8_t address[8], const float temp)
 {
   sentence.clear();
   sentence.print("TMP,"); 
-  for (int i = 0; i < 8; i++) {
-    ErikLib::HexPrint(sentence, *(address + i));
-  }
+  printAddress(sentence, address);
   sentence.comma();
   sentence.print(temp, 4);
-  Serial.print(sentence);
+  Serial1.print(sentence);
 }
 
+void sendCTLSentence()
+{
+  sentence.clear();
+  sentence.print("CTL,");
+  sentence.print(relayState);
+  Serial1.print(sentence);
+}
+
+void sendERRSentence(const int32_t code)
+{
+  sentence.clear();
+  sentence.print("ERR,");
+  sentence.print(code);
+  Serial1.print(sentence);
+}
+
+void sendAVGSentence()
+{
+  sentence.clear();
+  sentence.print("AVG,");
+  sentence.print(temperatureAverage);
+  Serial1.print(sentence);
+}
+
+void printAddress(Print& printer, const uint8_t address[8])
+{
+  for (int i = 0; i < 8; i++) {
+    ErikLib::HexPrint(printer, *(address + i));
+  }
+}
