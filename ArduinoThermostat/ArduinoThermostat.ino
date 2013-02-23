@@ -244,10 +244,11 @@ void owScanBus()
     uint8_t *ptr = owAddressArray;
     more = ow.search(ptr);
     for (uint8_t n = 0; n < count && more == 1; n++) {
+      sendSCNSentence(ptr);
       if (memcmp(ptr, masterSensor, 8) == 0) {
+        sendMTRSentence(ptr);
         masterFound = 1;
       }
-      sendSCNSentence(ptr);
       ptr += 8;
       owAddressArrayCount++;
       more = ow.search(ptr);
@@ -403,18 +404,20 @@ void loadConfiguration()
   uint8_t dat8_1, dat8_2;
   thermostatMode = EEPROM.read(0x10);
   oldThermostatMode = thermostatMode;
-  if (thermostatMode == TM_LOW) {
-    encoderValue = thermostatThresholdLow;
-  }
-  else {
-    encoderValue = thermostatThresholdNormal;
-  }
   dat8_1 = EEPROM.read(0x11);
   dat8_2 = EEPROM.read(0x12);
   thermostatThresholdNormal = (int16_t)(dat8_1) << 8 | dat8_2;
   dat8_1 = EEPROM.read(0x13);
   dat8_2 = EEPROM.read(0x14);
   thermostatThresholdLow = (int16_t)(dat8_1) << 8 | dat8_2;
+
+  if (thermostatMode == TM_LOW) {
+    encoderValue = thermostatThresholdLow;
+  }
+  else {
+    encoderValue = thermostatThresholdNormal;
+  }
+  
   dat8_1 = EEPROM.read(0x15);
   hysteresisUpper = (int8_t)dat8_1;
   dat8_1 = EEPROM.read(0x16);
@@ -596,7 +599,7 @@ void handleSentence()
   }
   n++;
   if (strncmp(token, "CFG", 3) == 0) {
-    if (tokens == 4) {
+    if (tokens == 7) {
       handleCFGSentence(n);
     }
     else {
@@ -616,7 +619,9 @@ void handleCFGSentence(const uint8_t n)
   int16_t len = 0;
   int16_t mode, normalThreshold, lowThreshold;
   int8_t hystUpper, hystLower;
+  uint32_t u32;
   uint8_t address[8] = {0};
+  char part[3] = {0};
   const char* token;
   token = reinterpret_cast<const char*>(parser.Token(n, len));
   mode = strtoul(token, 0, 10);
@@ -628,9 +633,12 @@ void handleCFGSentence(const uint8_t n)
   hystUpper = strtol(token, 0, 10);
   token = reinterpret_cast<const char*>(parser.Token(n+4, len));
   hystLower = strtol(token, 0, 10);
-  token = reinterpret_cast<const char*>(parser.Token(n+4, len));
+  token = reinterpret_cast<const char*>(parser.Token(n+5, len));
   for (uint8_t n = 0; n < 8; n++) {
-    address[n] = strtoul(token, 0, 16) & 0xff;
+    memcpy(part, token, 2);
+    part[2] = 0;
+    u32 = strtoul(part, 0, 16);
+    address[n] = u32 & 0xff;
     token += 2; 
   }
 
@@ -678,6 +686,14 @@ void sendSCNSentence(const uint8_t address[8])
 {
   sentence.clear();
   sentence.print("SCN,");
+  printAddress(sentence, address);
+  Serial1.print(sentence);
+}
+
+void sendMTRSentence(const uint8_t address[8])
+{
+  sentence.clear();
+  sentence.print("MTR,");
   printAddress(sentence, address);
   Serial1.print(sentence);
 }
