@@ -140,7 +140,7 @@ void loop()
   handleRelays(t);
   owHandler(t);
   dsHandler(t);
-  if (Serial1.available()) {
+  if (Serial1.available() > 0) {
     int16_t result = parser.Parse(Serial1);
     if (result == E_SUCCESS) {
       handleSentence();
